@@ -19,11 +19,11 @@ pub struct JrdLink {
 pub struct JrdResource {
     #[serde(rename = "subject")]
     pub subject: Option<String>,
-    #[serde(rename = "aliases")]
+    #[serde(rename = "aliases", default)]
     pub aliases: Vec<String>,
-    #[serde(rename = "properties")]
+    #[serde(rename = "properties", default)]
     pub properties: HashMap<String, String>,
-    #[serde(rename = "links")]
+    #[serde(rename = "links", default)]
     pub links: Vec<JrdLink>,
 }
 
@@ -77,4 +77,41 @@ pub fn merge_jrd(responses: Vec<(u16, JrdResource)>) -> JrdResource {
 
 pub fn to_json_bytes(resource: &JrdResource) -> Result<Vec<u8>, Error> {
     serde_json::to_vec(resource).map_err(Error::Json)
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_activitypub_response() {
+        let json = r#"{"subject":"acct:user@example.com","aliases":["https://social.example.com/users/user","https://social.example.com/@user"],"links":[{"rel":"http://webfinger.net/rel/profile-page","type":"text/html","href":"https://social.example.com/@user"},{"rel":"self","type":"application/activity+json","href":"https://social.example.com/users/user"}]}"#;
+        let jrd = parse_jrd(json.as_bytes()).expect("should parse ActivityPub response");
+        assert_eq!(jrd.subject, Some("acct:user@example.com".to_string()));
+        assert_eq!(jrd.aliases.len(), 2);
+        assert_eq!(jrd.links.len(), 2);
+        assert!(jrd.properties.is_empty());
+    }
+
+    #[test]
+    fn test_url_construction_with_resource() {
+        let base = url::Url::parse("http://social.example.svc.cluster.local:8080").unwrap();
+        let url = base.join(".well-known/webfinger").unwrap();
+        let resource = "acct:user@example.com";
+        let url = url.join(&format!("?resource={resource}")).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "http://social.example.svc.cluster.local:8080/.well-known/webfinger?resource=acct:user@example.com"
+        );
+    }
+
+    #[test]
+    fn test_parse_response_without_properties() {
+        let json = r#"{"subject":"acct:registry@example.com","aliases":["https://registry.example.com/ap/actor"],"links":[{"rel":"self","type":"application/activity+json","href":"https://registry.example.com/ap/actor"}]}"#;
+        let jrd = parse_jrd(json.as_bytes()).expect("should parse response missing properties field");
+        assert_eq!(jrd.subject, Some("acct:registry@example.com".to_string()));
+        assert_eq!(jrd.aliases.len(), 1);
+        assert_eq!(jrd.links.len(), 1);
+        assert!(jrd.properties.is_empty());
+    }
 }

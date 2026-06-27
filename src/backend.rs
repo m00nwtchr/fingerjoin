@@ -3,6 +3,7 @@ use crate::webfinger::{JrdResource, parse_jrd};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Semaphore;
+use tracing::{debug, warn};
 use url::Url;
 
 #[derive(Debug, Clone)]
@@ -27,19 +28,30 @@ pub async fn fetch_jrd(backend: &Backend, resource: &str) -> Result<JrdResource,
         .build()
         .map_err(Error::Request)?;
 
+    debug!(backend = %backend.name, url = %url, "fetching webfinger");
+
     let resp = client
-        .get(url)
+        .get(url.clone())
         .header("Accept", "application/jrd+json")
+        .header("User-Agent", concat!("fingerjoin/", env!("CARGO_PKG_VERSION")))
         .send()
         .await
         .map_err(Error::Request)?;
 
-    if resp.status() == 404 {
+    let status = resp.status();
+    debug!(backend = %backend.name, url = %url, status = %status, "received response");
+
+    if !status.is_success() {
         return Err(Error::AllBackendsFailed);
     }
 
     let bytes = resp.bytes().await.map_err(Error::Request)?;
-    let jrd = parse_jrd(&bytes)?;
+    debug!(backend = %backend.name, body = %String::from_utf8_lossy(&bytes), "response body");
+
+    let jrd = parse_jrd(&bytes).map_err(|e| {
+        warn!(backend = %backend.name, error = %e, "failed to parse JRD");
+        Error::Webfinger(e)
+    })?;
 
     Ok(jrd)
 }
