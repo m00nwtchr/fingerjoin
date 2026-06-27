@@ -1,4 +1,4 @@
-FROM rust:1.93-alpine3.22 as base
+FROM rust:1.93-alpine3.22 AS base
 RUN apk add --no-cache musl-dev
 RUN cargo install cargo-chef --version ^0.1
 

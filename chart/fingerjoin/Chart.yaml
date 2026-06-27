@@ -3,7 +3,7 @@ apiVersion: v2
 name: fingerjoin
 description: A Helm chart for fingerjoin WebFinger aggregation proxy
 type: application
-version: 0.1.0
+version: 0.2.0
 kubeVersion: ">=1.28.0-0"
 dependencies:
   - name: common
