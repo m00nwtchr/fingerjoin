@@ -16,6 +16,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::EnvFilter::from_default_env())
         .init();
 
+    let cluster_domain = std::env::var("CLUSTER_DOMAIN")
+        .unwrap_or_else(|_| "cluster.local".to_string());
+    let port = std::env::var("PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8080);
+
     info!("starting fingerjoin");
 
     let kube_client = kube::Client::try_default().await?;
@@ -24,12 +31,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let state = state.clone();
         tokio::spawn(async move {
-            k8s::start_reconciler(kube_client, state).await;
+            k8s::start_reconciler(kube_client, state, cluster_domain).await;
         });
     }
 
     let app = http::app(state);
-    let listener = tokio::net::TcpListener::bind("[::]:8080").await?;
+    let listener = tokio::net::TcpListener::bind(format!("[::]:{port}")).await?;
     axum::serve(listener, app).await?;
 
     Ok(())

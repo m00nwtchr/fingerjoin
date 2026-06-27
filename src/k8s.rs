@@ -58,19 +58,14 @@ struct RouteRule {
 #[derive(Debug, Clone, Deserialize)]
 struct BackendRef {
     #[serde(default)]
-    backend: Option<BackendName>,
-    #[serde(rename = "port", default)]
+    name: Option<String>,
+    #[serde(default)]
     port: Option<u16>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct BackendName {
-    name: String,
 }
 
 type HTTPRoute = Object<HTTPRouteSpec, NotUsed>;
 
-pub async fn start_reconciler(client: Client, state: Arc<BackendState>) {
+pub async fn start_reconciler(client: Client, state: Arc<BackendState>, cluster_domain: String) {
     let mut ticker = interval(Duration::from_secs(30));
 
     let discovery = Discovery::new(client.clone())
@@ -84,7 +79,7 @@ pub async fn start_reconciler(client: Client, state: Arc<BackendState>) {
     let (ar, _caps) = apigroup
         .recommended_resources()
         .iter()
-        .find(|(ar, _)| ar.kind == "HttpRoute")
+        .find(|(ar, _)| ar.kind == "HTTPRoute")
         .expect("HttpRoute not found")
         .clone();
     let api: Api<HTTPRoute> = Api::all_with(client.clone(), &ar);
@@ -140,16 +135,18 @@ pub async fn start_reconciler(client: Client, state: Arc<BackendState>) {
                 None => continue,
             };
 
-            let backend_name = match backend_entry.backend.as_ref() {
+            let backend_name = match backend_entry.name.as_deref() {
                 Some(n) => n,
                 None => continue,
             };
 
+            let namespace = route.metadata.namespace.as_deref().unwrap_or("default");
             let port = backend_entry.port.unwrap_or(if https { 443 } else { 80 });
             let scheme = if https { "https" } else { "http" };
-            let url = format!("{}://{}:{}", scheme, backend_name.name, port);
+            let host = format!("{}.{}.svc.{}", backend_name, namespace, cluster_domain);
+            let url = format!("{}://{}:{}", scheme, host, port);
             all_backends.push(Backend {
-                name: backend_name.name.clone(),
+                name: backend_name.to_string(),
                 url: url::Url::parse(&url).unwrap(),
                 priority,
             });

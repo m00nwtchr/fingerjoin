@@ -11,6 +11,10 @@ controllers:
           tag: master
           pullPolicy: IfNotPresent
 
+        # env:
+        #   CLUSTER_DOMAIN: cluster.local  # override if your cluster uses a custom domain
+        #   PORT: "8080"                   # override the listen port
+
         securityContext:
           allowPrivilegeEscalation: false
           capabilities: { drop: [ALL]}
