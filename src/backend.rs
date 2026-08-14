@@ -6,8 +6,7 @@ use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 use url::Url;
 
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Backend {
     pub name: String,
     pub url: Url,
