@@ -11,6 +11,32 @@ controllers:
           tag: master
           pullPolicy: IfNotPresent
 
+        # env:
+        #   CLUSTER_DOMAIN: cluster.local  # override if your cluster uses a custom domain
+        #   PORT: "8080"                   # override the listen port
+        #   LOG_FORMAT: json               # structured JSON logs
+        #   EXTRA_CA_CERTS: /certs/ca.crt  # PEM bundle for HTTPS backends with a private CA
+
+        probes:
+          liveness:
+            enabled: true
+            custom: true
+            spec:
+              httpGet:
+                path: /healthz
+                port: 8080
+              periodSeconds: 10
+              failureThreshold: 3
+          readiness:
+            enabled: true
+            custom: true
+            spec:
+              httpGet:
+                path: /readyz
+                port: 8080
+              periodSeconds: 5
+              failureThreshold: 3
+
         securityContext:
           allowPrivilegeEscalation: false
           capabilities: { drop: [ALL]}
