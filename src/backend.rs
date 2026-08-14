@@ -1,7 +1,6 @@
 use crate::error::Error;
-use crate::webfinger::{JrdResource, parse_jrd};
+use crate::webfinger::{parse_jrd, JrdResource};
 use std::sync::Arc;
-use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 use url::Url;
@@ -13,7 +12,11 @@ pub struct Backend {
     pub priority: u16,
 }
 
-pub async fn fetch_jrd(backend: &Backend, resource: &str) -> Result<JrdResource, Error> {
+pub async fn fetch_jrd(
+    client: &reqwest::Client,
+    backend: &Backend,
+    resource: &str,
+) -> Result<JrdResource, Error> {
     let url = backend
         .url
         .join(".well-known/webfinger")
@@ -22,17 +25,11 @@ pub async fn fetch_jrd(backend: &Backend, resource: &str) -> Result<JrdResource,
         .join(&format!("?resource={resource}"))
         .map_err(Error::Url)?;
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(Error::Request)?;
-
     debug!(backend = %backend.name, url = %url, "fetching webfinger");
 
     let resp = client
         .get(url.clone())
         .header("Accept", "application/jrd+json")
-        .header("User-Agent", concat!("fingerjoin/", env!("CARGO_PKG_VERSION")))
         .send()
         .await
         .map_err(Error::Request)?;
@@ -56,21 +53,21 @@ pub async fn fetch_jrd(backend: &Backend, resource: &str) -> Result<JrdResource,
 }
 
 pub async fn fan_out(
+    client: &reqwest::Client,
     backends: &[Backend],
     resource: &str,
-    semaphore: Arc<Semaphore>,
+    max_in_flight: usize,
 ) -> Vec<(u16, JrdResource)> {
-    let futures = backends.iter().map(|backend| {
-        let backend = backend.clone();
-        let resource = resource.to_string();
-        let sem = semaphore.clone();
+    let semaphore = Arc::new(Semaphore::new(max_in_flight));
 
+    let futures = backends.iter().map(|backend| {
+        let sem = semaphore.clone();
         async move {
-            let _guard = sem.acquire().await.ok()?;
-            fetch_jrd(&backend, &resource)
+            let _guard = sem.acquire().await.expect("semaphore never closed");
+            fetch_jrd(client, backend, resource)
                 .await
                 .ok()
-                .map(|jr| (backend.priority, jr))
+                .map(|jrd| (backend.priority, jrd))
         }
     });
 

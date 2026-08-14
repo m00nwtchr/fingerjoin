@@ -241,7 +241,6 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "futures",
- "http",
  "k8s-openapi",
  "kube",
  "reqwest",

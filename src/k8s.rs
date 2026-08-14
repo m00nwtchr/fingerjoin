@@ -7,7 +7,7 @@ use kube::{
 use serde::Deserialize;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio::time::{interval, MissedTickBehavior};
 use tracing::{debug, error, info, warn};
@@ -22,29 +22,44 @@ const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 
 pub struct BackendState {
     backends: RwLock<Vec<Backend>>,
+    last_sync: RwLock<Option<Instant>>,
 }
 
 impl BackendState {
     pub fn new() -> Self {
         Self {
             backends: RwLock::new(Vec::new()),
+            last_sync: RwLock::new(None),
         }
     }
 
     pub async fn update(&self, new_backends: Vec<Backend>) {
-        let mut backends = self.backends.write().await;
-        if *backends != new_backends {
-            info!(
-                count = new_backends.len(),
-                backends = ?new_backends.iter().map(|b| b.url.as_str()).collect::<Vec<_>>(),
-                "backend set changed"
-            );
-            *backends = new_backends;
+        {
+            let mut backends = self.backends.write().await;
+            if *backends != new_backends {
+                info!(
+                    count = new_backends.len(),
+                    backends = ?new_backends.iter().map(|b| b.url.as_str()).collect::<Vec<_>>(),
+                    "backend set changed"
+                );
+                *backends = new_backends;
+            }
         }
+        *self.last_sync.write().await = Some(Instant::now());
     }
 
     pub async fn get_all(&self) -> Vec<Backend> {
         self.backends.read().await.clone()
+    }
+
+    /// True once at least one HTTPRoute list has completed. Readiness gates
+    /// on this so pods do not receive traffic before the first sync.
+    pub async fn synced(&self) -> bool {
+        self.last_sync.read().await.is_some()
+    }
+
+    pub async fn last_sync_age(&self) -> Option<Duration> {
+        self.last_sync.read().await.map(|t| t.elapsed())
     }
 }
 
