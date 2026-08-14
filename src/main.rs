@@ -2,6 +2,8 @@ mod backend;
 mod error;
 mod http;
 mod k8s;
+#[cfg(test)]
+mod testutil;
 mod webfinger;
 
 use std::sync::Arc;
