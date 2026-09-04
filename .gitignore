@@ -1,6 +1,7 @@
 .devenv
 /target
 .direnv
+.worktrees/
 .envrc
 *.swp
 *.swo
