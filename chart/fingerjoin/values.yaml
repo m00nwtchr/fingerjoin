@@ -78,8 +78,8 @@ rbac:
       type: ClusterRole
       label: "{{ .Release.Name }}-fingerjoin"
       rules:
-        - apiGroups: ["gateway.networking.k8s.io"]
-          resources: ["httproutes"]
+        - apiGroups: [""]
+          resources: ["services"]
           verbs: ["get", "list", "watch"]
   bindings:
     fingerjoin:

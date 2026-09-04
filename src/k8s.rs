@@ -1,24 +1,21 @@
 use crate::backend::Backend;
+use k8s_openapi::api::core::v1::Service;
 use kube::{
-    api::{Api, ListParams, NotUsed, Object},
-    discovery::Discovery,
     Client,
+    api::{Api, ListParams},
 };
-use serde::Deserialize;
-use std::str::FromStr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
+use std::{str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
-use tokio::time::{interval, MissedTickBehavior};
+use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval_at};
 use tracing::{debug, error, info, warn};
 
 const WEBFINGER_KEY: &str = "fingerjoin.naktis.eu/webfinger";
 const PRIORITY_KEY: &str = "fingerjoin.naktis.eu/priority";
 const HTTPS_KEY: &str = "fingerjoin.naktis.eu/https";
-const BACKEND_KEY: &str = "fingerjoin.naktis.eu/backend";
+const PORT_KEY: &str = "fingerjoin.naktis.eu/port";
 
 pub const SYNC_INTERVAL: Duration = Duration::from_secs(30);
-const GATEWAY_API_GROUP: &str = "gateway.networking.k8s.io";
 
 pub struct BackendState {
     backends: RwLock<Vec<Backend>>,
@@ -52,7 +49,7 @@ impl BackendState {
         self.backends.read().await.clone()
     }
 
-    /// True once at least one HTTPRoute list has completed. Readiness gates
+    /// True once at least one Service list has completed. Readiness gates
     /// on this so pods do not receive traffic before the first sync.
     pub async fn synced(&self) -> bool {
         self.last_sync.read().await.is_some()
@@ -69,111 +66,38 @@ impl Default for BackendState {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-struct HTTPRouteSpec {
-    #[serde(default)]
-    rules: Vec<RouteRule>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct RouteRule {
-    #[serde(rename = "backendRefs", default)]
-    backend_refs: Vec<BackendRef>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct BackendRef {
-    #[serde(default)]
-    group: Option<String>,
-    #[serde(default)]
-    kind: Option<String>,
-    #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
-    namespace: Option<String>,
-    #[serde(default)]
-    port: Option<u16>,
-}
-
-type HTTPRoute = Object<HTTPRouteSpec, NotUsed>;
-
 pub async fn start_reconciler(client: Client, state: Arc<BackendState>, cluster_domain: String) {
-    let api = discover_httproute_api(&client).await;
+    let api: Api<Service> = Api::all(client);
 
-    let mut ticker = interval(SYNC_INTERVAL);
+    let mut ticker = interval_at(TokioInstant::now() + SYNC_INTERVAL, SYNC_INTERVAL);
     ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
     loop {
         ticker.tick().await;
 
         match api.list(&ListParams::default()).await {
-            Ok(routes) => {
-                let backends = backends_from_routes(routes, &cluster_domain);
+            Ok(services) => {
+                let backends = backends_from_services(services, &cluster_domain);
                 state.update(backends).await;
             }
             Err(e) => {
                 // Keep serving the previous backend set; readiness stays
                 // green because a stale list beats no service at all.
-                error!(error = %e, "failed to list HTTPRoutes, keeping previous backends");
+                error!(error = %e, "failed to list Services, keeping previous backends");
             }
         }
     }
 }
 
-/// Resolve the HTTPRoute API, retrying with backoff until the Gateway API is
-/// available. This must never panic: with `panic = "abort"` a failed startup
-/// discovery would kill the whole process, and a dead reconciler task would
-/// otherwise leave the proxy serving zero backends forever.
-async fn discover_httproute_api(client: &Client) -> Api<HTTPRoute> {
-    let mut delay = Duration::from_secs(5);
-    loop {
-        match try_discover(client).await {
-            Ok(api) => {
-                info!("discovered HTTPRoute API");
-                return api;
-            }
-            Err(e) => {
-                error!(error = %e, retry_in_seconds = delay.as_secs(), "Gateway API discovery failed");
-                tokio::time::sleep(delay).await;
-                delay = (delay * 2).min(Duration::from_secs(60));
-            }
-        }
-    }
-}
-
-async fn try_discover(client: &Client) -> Result<Api<HTTPRoute>, String> {
-    let discovery = Discovery::new(client.clone())
-        .filter(&[GATEWAY_API_GROUP])
-        .run()
-        .await
-        .map_err(|e| format!("API discovery failed: {e}"))?;
-
-    let group = discovery
-        .groups()
-        .find(|g| g.name() == GATEWAY_API_GROUP)
-        .ok_or_else(|| {
-            format!("{GATEWAY_API_GROUP} API group not found (is the Gateway API installed?)")
-        })?;
-
-    let (ar, _caps) = group
-        .recommended_resources()
-        .iter()
-        .find(|(ar, _)| ar.kind == "HTTPRoute")
-        .ok_or_else(|| format!("HTTPRoute kind not found in {GATEWAY_API_GROUP}"))?
-        .clone();
-
-    Ok(Api::all_with(client.clone(), &ar))
-}
-
-/// Map annotated HTTPRoutes to backends, deduplicating by URL (highest
+/// Map annotated Services to backends, deduplicating by URL (highest
 /// priority wins) and sorting for stable change detection.
-fn backends_from_routes(
-    routes: impl IntoIterator<Item = HTTPRoute>,
+fn backends_from_services(
+    services: impl IntoIterator<Item = Service>,
     cluster_domain: &str,
 ) -> Vec<Backend> {
     let mut backends: Vec<Backend> = Vec::new();
-    for route in routes {
-        let Some(b) = backend_from_route(&route, cluster_domain) else {
+    for service in services {
+        let Some(b) = backend_from_service(&service, cluster_domain) else {
             continue;
         };
         if let Some(existing) = backends.iter_mut().find(|e| e.url == b.url) {
@@ -188,8 +112,8 @@ fn backends_from_routes(
     backends
 }
 
-fn backend_from_route(route: &HTTPRoute, cluster_domain: &str) -> Option<Backend> {
-    let annotations = route.metadata.annotations.as_ref()?;
+fn backend_from_service(service: &Service, cluster_domain: &str) -> Option<Backend> {
+    let annotations = service.metadata.annotations.as_ref()?;
 
     let is_webfinger = annotations
         .get(WEBFINGER_KEY)
@@ -198,67 +122,75 @@ fn backend_from_route(route: &HTTPRoute, cluster_domain: &str) -> Option<Backend
         return None;
     }
 
-    let route_namespace = route.metadata.namespace.as_deref().unwrap_or("default");
-    let route_id = format!(
-        "{route_namespace}/{}",
-        route.metadata.name.as_deref().unwrap_or("<unnamed>")
+    let namespace = service.metadata.namespace.as_deref().unwrap_or("default");
+    let service_id = format!(
+        "{namespace}/{}",
+        service.metadata.name.as_deref().unwrap_or("<unnamed>")
     );
 
-    let priority: u16 = parse_annotation(annotations, PRIORITY_KEY, 50, &route_id);
-    let backend_index: usize = parse_annotation(annotations, BACKEND_KEY, 0, &route_id);
+    let priority: u16 = parse_annotation(annotations, PRIORITY_KEY, 50, &service_id);
     let https = annotations
         .get(HTTPS_KEY)
         .is_some_and(|v| v.eq_ignore_ascii_case("true"));
 
-    let Some(rule) = route.spec.rules.get(backend_index) else {
-        warn!(
-            route = %route_id,
-            index = backend_index,
-            rules = route.spec.rules.len(),
-            "backend rule index out of range, skipping route"
-        );
-        return None;
-    };
-
-    let Some(backend_ref) = rule.backend_refs.first() else {
-        warn!(route = %route_id, "rule has no backendRefs, skipping route");
-        return None;
-    };
-
-    // Only core/v1 Services resolve to a stable cluster DNS name.
-    let group_ok = backend_ref.group.as_deref().is_none_or(str::is_empty);
-    let kind_ok = backend_ref.kind.as_deref().is_none_or(|k| k == "Service");
-    if !group_ok || !kind_ok {
-        warn!(
-            route = %route_id,
-            group = backend_ref.group.as_deref().unwrap_or(""),
-            kind = backend_ref.kind.as_deref().unwrap_or("Service"),
-            "backendRef is not a core Service, skipping route"
-        );
+    let ports = service.spec.as_ref().and_then(|spec| spec.ports.as_ref());
+    let usable_ports = ports
+        .into_iter()
+        .flatten()
+        .filter(|port| port.port > 0)
+        .collect::<Vec<_>>();
+    if usable_ports.is_empty() {
+        warn!(service = %service_id, "Service has no usable positive ports, skipping");
         return None;
     }
 
-    let Some(backend_name) = backend_ref.name.as_deref() else {
-        warn!(route = %route_id, "backendRef has no name, skipping route");
-        return None;
+    let (selected, auto_selected) = match annotations.get(PORT_KEY) {
+        Some(name) => {
+            let Some(port) = usable_ports
+                .iter()
+                .find(|port| port.name.as_deref() == Some(name))
+            else {
+                warn!(service = %service_id, port = %name, "explicit Service port name not found, skipping");
+                return None;
+            };
+            (port, false)
+        }
+        None => {
+            let preferred_name = if https { "https" } else { "http" };
+            let secondary_name = if https { "http" } else { "https" };
+            let port = usable_ports
+                .iter()
+                .find(|port| port.name.as_deref() == Some(preferred_name))
+                .or_else(|| {
+                    usable_ports
+                        .iter()
+                        .find(|port| port.name.as_deref() == Some(secondary_name))
+                })
+                .unwrap_or(&usable_ports[0]);
+            (port, true)
+        }
     };
 
-    // An explicit backendRef namespace (cross-namespace routing via
-    // ReferenceGrant) takes precedence over the route's own namespace.
-    let namespace = backend_ref.namespace.as_deref().unwrap_or(route_namespace);
-    let scheme = if https { "https" } else { "http" };
-    let port = backend_ref.port.unwrap_or(if https { 443 } else { 80 });
-    let url = format!("{scheme}://{backend_name}.{namespace}.svc.{cluster_domain}:{port}");
+    let scheme = if https || (auto_selected && selected.name.as_deref() == Some("https")) {
+        "https"
+    } else {
+        "http"
+    };
+    let backend_name = service.metadata.name.as_deref().unwrap_or("<unnamed>");
+    let url = format!(
+        "{scheme}://{backend_name}.{namespace}.svc.{cluster_domain}:{}",
+        selected.port
+    );
 
     let url = match url::Url::parse(&url) {
         Ok(u) => u,
         Err(e) => {
-            warn!(route = %route_id, url = %url, error = %e, "backend URL invalid, skipping route");
+            warn!(service = %service_id, url = %url, error = %e, "backend URL invalid, skipping Service");
             return None;
         }
     };
 
-    debug!(route = %route_id, url = %url, priority, "registered webfinger backend");
+    debug!(service = %service_id, url = %url, priority, "registered webfinger backend");
 
     Some(Backend {
         name: backend_name.to_string(),
@@ -271,12 +203,12 @@ fn parse_annotation<T: FromStr + Copy>(
     annotations: &std::collections::BTreeMap<String, String>,
     key: &str,
     default: T,
-    route_id: &str,
+    service_id: &str,
 ) -> T {
     match annotations.get(key) {
         None => default,
         Some(raw) => raw.parse().unwrap_or_else(|_| {
-            warn!(route = %route_id, annotation = key, value = %raw, "invalid annotation value, using default");
+            warn!(service = %service_id, annotation = key, value = %raw, "invalid annotation value, using default");
             default
         }),
     }
@@ -285,118 +217,209 @@ fn parse_annotation<T: FromStr + Copy>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use k8s_openapi::api::core::v1::Service;
     use serde_json::json;
 
-    fn route(annotations: serde_json::Value, spec: serde_json::Value) -> HTTPRoute {
+    fn service(annotations: serde_json::Value, ports: serde_json::Value) -> Service {
         serde_json::from_value(json!({
-            "apiVersion": "gateway.networking.k8s.io/v1",
-            "kind": "HTTPRoute",
+            "apiVersion": "v1",
+            "kind": "Service",
             "metadata": {
-                "name": "test-route",
+                "name": "test-service",
                 "namespace": "apps",
                 "annotations": annotations,
             },
-            "spec": spec,
+            "spec": {"ports": ports},
         }))
-        .expect("test route should deserialize")
+        .expect("test service should deserialize")
     }
 
-    fn simple_spec() -> serde_json::Value {
-        json!({"rules": [{"backendRefs": [{"name": "mastodon-web", "port": 3000}]}]})
-    }
-
-    #[test]
-    fn test_unannotated_route_ignored() {
-        let r = route(json!({}), simple_spec());
-        assert!(backend_from_route(&r, "cluster.local").is_none());
+    fn ports() -> serde_json::Value {
+        json!([
+            {"name": "http", "port": 8080},
+            {"name": "https", "port": 8443}
+        ])
     }
 
     #[test]
-    fn test_annotated_route_resolves_fqdn() {
-        let r = route(json!({WEBFINGER_KEY: "true"}), simple_spec());
-        let b = backend_from_route(&r, "cluster.local").expect("should resolve");
+    fn unannotated_service_is_ignored() {
+        let service = service(json!({}), ports());
+        assert!(backend_from_service(&service, "cluster.local").is_none());
+    }
+
+    #[test]
+    fn webfinger_annotation_is_case_insensitive() {
+        let service = service(json!({WEBFINGER_KEY: "TrUe"}), ports());
+        let b = backend_from_service(&service, "cluster.local").expect("should resolve");
         assert_eq!(
             b.url.as_str(),
-            "http://mastodon-web.apps.svc.cluster.local:3000/"
+            "http://test-service.apps.svc.cluster.local:8080/"
         );
         assert_eq!(b.priority, 50);
     }
 
     #[test]
-    fn test_https_default_port() {
-        let r = route(
-            json!({WEBFINGER_KEY: "true", HTTPS_KEY: "true"}),
-            json!({"rules": [{"backendRefs": [{"name": "keyserver"}]}]}),
-        );
-        let b = backend_from_route(&r, "cluster.local").expect("should resolve");
-        assert_eq!(b.url.scheme(), "https");
-        assert_eq!(b.url.port_or_known_default(), Some(443));
-    }
-
-    #[test]
-    fn test_cross_namespace_backend_ref() {
-        let r = route(
-            json!({WEBFINGER_KEY: "true"}),
-            json!({"rules": [{"backendRefs": [{"name": "svc", "namespace": "other", "port": 80}]}]}),
-        );
-        let b = backend_from_route(&r, "cluster.local").expect("should resolve");
-        assert_eq!(b.url.host_str(), Some("svc.other.svc.cluster.local"));
-    }
-
-    #[test]
-    fn test_non_service_backend_ref_skipped() {
-        let r = route(
-            json!({WEBFINGER_KEY: "true"}),
-            json!({"rules": [{"backendRefs": [{"name": "fn", "kind": "ServiceImport", "group": "multicluster.x-k8s.io"}]}]}),
-        );
-        assert!(backend_from_route(&r, "cluster.local").is_none());
-    }
-
-    #[test]
-    fn test_backend_index_out_of_range_skipped() {
-        let r = route(
-            json!({WEBFINGER_KEY: "true", BACKEND_KEY: "3"}),
-            simple_spec(),
-        );
-        assert!(backend_from_route(&r, "cluster.local").is_none());
-    }
-
-    #[test]
-    fn test_invalid_priority_uses_default() {
-        let r = route(
+    fn priority_defaults_and_malformed_values_fall_back() {
+        let defaulted = service(json!({WEBFINGER_KEY: "true"}), ports());
+        let malformed = service(
             json!({WEBFINGER_KEY: "true", PRIORITY_KEY: "not-a-number"}),
-            simple_spec(),
+            ports(),
         );
-        let b = backend_from_route(&r, "cluster.local").expect("should resolve");
-        assert_eq!(b.priority, 50);
+        assert_eq!(
+            backend_from_service(&defaulted, "cluster.local")
+                .unwrap()
+                .priority,
+            50
+        );
+        assert_eq!(
+            backend_from_service(&malformed, "cluster.local")
+                .unwrap()
+                .priority,
+            50
+        );
     }
 
     #[test]
-    fn test_custom_priority_and_backend_index() {
-        let r = route(
-            json!({WEBFINGER_KEY: "true", PRIORITY_KEY: "100", BACKEND_KEY: "1"}),
-            json!({"rules": [
-                {"backendRefs": [{"name": "first", "port": 80}]},
-                {"backendRefs": [{"name": "second", "port": 8080}]}
-            ]}),
+    fn custom_priority_is_used() {
+        let service = service(json!({WEBFINGER_KEY: "true", PRIORITY_KEY: "100"}), ports());
+        assert_eq!(
+            backend_from_service(&service, "cluster.local")
+                .unwrap()
+                .priority,
+            100
         );
-        let b = backend_from_route(&r, "cluster.local").expect("should resolve");
-        assert_eq!(b.priority, 100);
-        assert_eq!(b.url.host_str(), Some("second.apps.svc.cluster.local"));
     }
 
     #[test]
-    fn test_dedup_keeps_highest_priority() {
-        let a = route(
-            json!({WEBFINGER_KEY: "true", PRIORITY_KEY: "10"}),
-            simple_spec(),
+    fn http_annotation_prefers_http_then_https() {
+        let service = service(json!({WEBFINGER_KEY: "true"}), ports());
+        let b = backend_from_service(&service, "cluster.local").unwrap();
+        assert_eq!(b.url.port(), Some(8080));
+        assert_eq!(b.url.scheme(), "http");
+    }
+
+    #[test]
+    fn https_annotation_reverses_named_port_preference() {
+        let service = service(json!({WEBFINGER_KEY: "true", HTTPS_KEY: "true"}), ports());
+        let b = backend_from_service(&service, "cluster.local").unwrap();
+        assert_eq!(b.url.port(), Some(8443));
+        assert_eq!(b.url.scheme(), "https");
+    }
+
+    #[test]
+    fn unnamed_ports_fall_back_to_first_usable_port() {
+        let service = service(
+            json!({WEBFINGER_KEY: "true"}),
+            json!([
+                {"name": "metrics", "port": 9090},
+                {"name": "invalid", "port": 0}
+            ]),
         );
-        let b = route(
-            json!({WEBFINGER_KEY: "true", PRIORITY_KEY: "90"}),
-            simple_spec(),
+        let b = backend_from_service(&service, "cluster.local").unwrap();
+        assert_eq!(b.url.port(), Some(9090));
+    }
+
+    #[test]
+    fn explicit_port_name_overrides_automatic_selection() {
+        let service = service(
+            json!({WEBFINGER_KEY: "true", PORT_KEY: "metrics"}),
+            json!([
+                {"name": "http", "port": 8080},
+                {"name": "metrics", "port": 9090}
+            ]),
         );
-        let backends = backends_from_routes(vec![a, b], "cluster.local");
-        assert_eq!(backends.len(), 1);
-        assert_eq!(backends[0].priority, 90);
+        let b = backend_from_service(&service, "cluster.local").unwrap();
+        assert_eq!(b.url.port(), Some(9090));
+        assert_eq!(b.url.scheme(), "http");
+    }
+
+    #[test]
+    fn missing_explicit_port_name_skips_service() {
+        let service = service(json!({WEBFINGER_KEY: "true", PORT_KEY: "missing"}), ports());
+        assert!(backend_from_service(&service, "cluster.local").is_none());
+    }
+
+    #[test]
+    fn https_named_port_uses_actual_non_443_port() {
+        let service = service(
+            json!({WEBFINGER_KEY: "true"}),
+            json!([
+                {"name": "https", "port": 8443}
+            ]),
+        );
+        let b = backend_from_service(&service, "cluster.local").unwrap();
+        assert_eq!(
+            b.url.as_str(),
+            "https://test-service.apps.svc.cluster.local:8443/"
+        );
+    }
+
+    #[test]
+    fn explicit_custom_port_https_depends_on_annotation() {
+        let http = service(
+            json!({WEBFINGER_KEY: "true", PORT_KEY: "custom"}),
+            json!([
+                {"name": "custom", "port": 9443}
+            ]),
+        );
+        let https = service(
+            json!({WEBFINGER_KEY: "true", PORT_KEY: "custom", HTTPS_KEY: "TRUE"}),
+            json!([{ "name": "custom", "port": 9443 }]),
+        );
+        assert_eq!(
+            backend_from_service(&http, "cluster.local")
+                .unwrap()
+                .url
+                .scheme(),
+            "http"
+        );
+        assert_eq!(
+            backend_from_service(&https, "cluster.local")
+                .unwrap()
+                .url
+                .scheme(),
+            "https"
+        );
+    }
+
+    #[test]
+    fn namespace_falls_back_to_default_for_fqdn() {
+        let mut service = service(json!({WEBFINGER_KEY: "true"}), ports());
+        service.metadata.namespace = None;
+        let b = backend_from_service(&service, "cluster.local").unwrap();
+        assert_eq!(
+            b.url.host_str(),
+            Some("test-service.default.svc.cluster.local")
+        );
+    }
+
+    #[test]
+    fn service_without_usable_ports_is_skipped() {
+        let service = service(
+            json!({WEBFINGER_KEY: "true"}),
+            json!([
+                {"name": "http", "port": 0},
+                {"name": "https", "port": -1}
+            ]),
+        );
+        assert!(backend_from_service(&service, "cluster.local").is_none());
+    }
+
+    #[test]
+    fn duplicate_urls_keep_highest_priority_and_sort() {
+        let low = service(json!({WEBFINGER_KEY: "true", PRIORITY_KEY: "10"}), ports());
+        let high = service(json!({WEBFINGER_KEY: "true", PRIORITY_KEY: "90"}), ports());
+        let other = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": "another-service", "namespace": "apps", "annotations": {WEBFINGER_KEY: "true"}},
+            "spec": {"ports": [{"name": "http", "port": 8080}]}
+        }))
+        .expect("test service should deserialize");
+
+        let backends = backends_from_services(vec![low, other, high], "cluster.local");
+        assert_eq!(backends.len(), 2);
+        assert_eq!(backends[0].name, "another-service");
+        assert_eq!(backends[1].priority, 90);
     }
 }

@@ -5,27 +5,34 @@ Usage:
   helm install fingerjoin ./chart/fingerjoin -n fingerjoin --create-namespace
 
 Configuration:
-  The fingerjoin proxy watches HTTPRoutes with these annotations:
-  - fingerjoin.naktis.eu/webfinger: "true" (required to enable)
-  - fingerjoin.naktis.eu/priority: "50" (optional, default 50)
-  - fingerjoin.naktis.eu/https: "true" (optional, default false)
-  - fingerjoin.naktis.eu/backend: "0" (optional, which backend rule to use)
+  The fingerjoin proxy watches annotated core Services:
+  - fingerjoin.naktis.eu/webfinger: "true" (required, case-insensitive)
+  - fingerjoin.naktis.eu/port: "https" (optional exact Service port name)
+  - fingerjoin.naktis.eu/priority: "50" (optional, malformed values use 50)
+  - fingerjoin.naktis.eu/https: "true" (optional, case-insensitive, default false)
 
-Example HTTPRoute:
-  apiVersion: gateway.networking.k8s.io/v1
-  kind: HTTPRoute
+  Without a port annotation, Services prefer the first usable port named
+  "http", then "https", then the first declared usable positive port.
+  With https=true, that order is reversed: "https", then "http", then the
+  first declared usable positive port. The actual numeric Service port is
+  always used; HTTPS never implies port 443. An automatically selected
+  "https" port uses the https scheme. An explicitly named custom port remains
+  HTTP unless https=true.
+
+Example Service:
+  apiVersion: v1
+  kind: Service
   metadata:
+    name: my-service
+    namespace: apps
     annotations:
       fingerjoin.naktis.eu/webfinger: "true"
       fingerjoin.naktis.eu/https: "true"
       fingerjoin.naktis.eu/priority: "100"
   spec:
-    parentRefs:
-      - my-gateway
-    rules:
-      - backendRefs:
-          - name: my-service
-            port: 443
+    ports:
+      - name: https
+        port: 8443
 */}}
 
 {{- include "bjw-s.common.loader.init" . -}}
