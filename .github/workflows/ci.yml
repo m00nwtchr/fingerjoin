@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [master]
+    tags: ['*.*.*']
   pull_request:
     branches: [master]
 
@@ -59,6 +60,16 @@ jobs:
             runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
+
+      - name: Validate release tag
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Release tag is not numeric semver: $GITHUB_REF_NAME" >&2
+            exit 1
+          }
 
       - name: Set lowercase registry
         run: echo "REGISTRY=ghcr.io/$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
@@ -162,7 +173,12 @@ jobs:
 
       - name: Sign image
         run: |
-          IMAGE_DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY }}:master --format '{{.Manifest.Digest}}')
-          cosign sign --yes ${{ env.REGISTRY }}:master@${IMAGE_DIGEST}
+          set -euo pipefail
+          IMAGE_TAG=master
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            IMAGE_TAG="$GITHUB_REF_NAME"
+          fi
+          IMAGE_DIGEST=$(docker buildx imagetools inspect "${{ env.REGISTRY }}:${IMAGE_TAG}" --format '{{.Manifest.Digest}}')
+          cosign sign --yes "${{ env.REGISTRY }}:${IMAGE_TAG}@${IMAGE_DIGEST}"
         env:
           COSIGN_EXPERIMENTAL: 1

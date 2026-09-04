@@ -3,6 +3,7 @@ name: Helm Chart CI
 on:
   push:
     branches: [master]
+    tags: ['*.*.*']
     paths:
       - 'chart/**'
       - '.github/workflows/helm.yml'
@@ -22,6 +23,43 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Get chart version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(awk '$0 ~ /^version:[[:space:]]/ { print $2; exit }' chart/fingerjoin/Chart.yaml)
+          APP_VERSION=$(awk '$0 ~ /^appVersion:[[:space:]]/ { print $2; exit }' chart/fingerjoin/Chart.yaml | tr -d '"')
+          IMAGE_TAG=$(awk '$0 ~ /^[[:space:]]+tag:[[:space:]]/ { print $2; exit }' chart/fingerjoin/values.yaml)
+          CARGO_VERSION=$(awk '$0 ~ /^version[[:space:]]*=[[:space:]]*"/ { gsub(/"/, "", $3); print $3; exit }' Cargo.toml)
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "Chart version is not numeric semver: $VERSION" >&2
+            exit 1
+          }
+          [[ "$APP_VERSION" == "$VERSION" ]] || {
+            echo "Chart appVersion $APP_VERSION does not match chart version $VERSION" >&2
+            exit 1
+          }
+          [[ "$CARGO_VERSION" == "$VERSION" ]] || {
+            echo "Cargo package version $CARGO_VERSION does not match chart version $VERSION" >&2
+            exit 1
+          }
+          [[ "$IMAGE_TAG" == "$VERSION" ]] || {
+            echo "Source image tag $IMAGE_TAG does not match chart version $VERSION" >&2
+            exit 1
+          }
+          if [[ "$GITHUB_REF_TYPE" == "tag" ]]; then
+            [[ "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+              echo "Release tag is not numeric semver: $GITHUB_REF_NAME" >&2
+              exit 1
+            }
+            [[ "$GITHUB_REF_NAME" == "$VERSION" ]] || {
+              echo "Release tag $GITHUB_REF_NAME does not match chart version $VERSION" >&2
+              exit 1
+            }
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Set lowercase registry
         run: echo "HELM_REGISTRY=ghcr.io/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/charts" >> $GITHUB_ENV
@@ -48,29 +86,66 @@ jobs:
           OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
           sed -i "s|repository: ghcr.io/.*/fingerjoin|repository: ghcr.io/${OWNER}/fingerjoin|" chart/fingerjoin/values.yaml
 
+      - name: Resolve release image digest
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/fingerjoin:${{ steps.version.outputs.VERSION }}"
+          for attempt in {1..60}; do
+            if DIGEST=$(docker buildx imagetools inspect "$IMAGE" --format '{{.Manifest.Digest}}' 2>/dev/null) && [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "IMAGE_DIGEST=$DIGEST" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            echo "Waiting for release image $IMAGE (attempt $attempt/60)"
+            sleep 10
+          done
+          echo "Timed out waiting for exact release image tag: $IMAGE" >&2
+          exit 1
+
+      - name: Pin release image digest
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i -E "s|^([[:space:]]*)digest:.*|\1digest: ${IMAGE_DIGEST}|" chart/fingerjoin/values.yaml
+
       - name: Build dependencies
         run: helm dependency build chart/fingerjoin
+
+      - name: Validate chart
+        run: helm lint chart/fingerjoin
+
+      - name: Verify release image pin
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          helm template fingerjoin chart/fingerjoin > /tmp/fingerjoin-rendered.yaml
+          OWNER=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')
+          IMAGE="ghcr.io/${OWNER}/fingerjoin:${{ steps.version.outputs.VERSION }}@${IMAGE_DIGEST}"
+          grep -Fq "$IMAGE" /tmp/fingerjoin-rendered.yaml || {
+            echo "Rendered chart does not contain pinned image reference $IMAGE" >&2
+            exit 1
+          }
 
       - name: Package chart
         run: |
           mkdir -p dist
           helm package chart/fingerjoin --destination ./dist
 
-      - name: Get chart version
-        id: version
-        run: echo "VERSION=$(grep '^version:' chart/fingerjoin/Chart.yaml | awk '{print $2}')" >> $GITHUB_OUTPUT
-
       - name: Push chart
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: |
           helm push ./dist/*.tgz oci://${{ env.HELM_REGISTRY }}
 
       - name: Install cosign
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         uses: sigstore/cosign-installer@v3
 
       - name: Sign chart
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push' && github.ref_type == 'tag'
         run: |
           cosign sign --yes ${{ env.HELM_REGISTRY }}/fingerjoin:${{ steps.version.outputs.VERSION }}
         env:
