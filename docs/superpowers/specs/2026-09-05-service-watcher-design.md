@@ -72,13 +72,13 @@ events update the derived state without waiting for the old polling interval.
 
 Watcher errors are logged and do not modify `BackendState`. The watcher stream's
 default backoff and reconnect behavior retries the API operation and produces an
-`Init` sequence when it relists. The reconciler keeps polling the stream, so an
+`Init` sequence when it relists. The reconciler keeps consuming the stream, so an
 individual watch failure cannot silently stop backend updates.
 
 Before the first successful complete snapshot, readiness remains `503` and the
 backend list remains empty. After one successful snapshot, readiness remains
 `200` and requests continue using the last known backend list during transient
-watch/API failures. A later full restart atomically replaces the derived list
+watch/API failures. A later full relist atomically replaces the derived list
 and refreshes the sync timestamp.
 
 ## Testing
@@ -93,7 +93,7 @@ tests will exercise the event-cache reducer without a live Kubernetes cluster:
 - a deleted event removes a Service;
 - a relist sequence removes stale cached Services at `InitDone`;
 - derived backend ordering and priority behavior remain intact;
-- backend state remains unchanged when an event-processing error is reported.
+- an incomplete initialization sequence does not publish partial state.
 
 Validation will include:
 
