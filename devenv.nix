@@ -15,9 +15,6 @@ in
   packages =
     with pkgs;
     [
-      dragonflydb
-      stunnel
-      redis
       openssl
     ]
     ++ (lib.optionals (!config.container.isBuilding) [
