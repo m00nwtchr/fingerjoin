@@ -3,9 +3,10 @@ use k8s_openapi::api::core::v1::Service;
 use kube::{
     Client,
     api::{Api, ListParams},
+    runtime::watcher,
 };
 use std::time::{Duration, Instant};
-use std::{str::FromStr, sync::Arc};
+use std::{collections::HashMap, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
 use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval_at};
 use tracing::{debug, error, info, warn};
@@ -63,6 +64,53 @@ impl BackendState {
 impl Default for BackendState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn service_key(service: &Service) -> String {
+    format!(
+        "{}/{}",
+        service.metadata.namespace.as_deref().unwrap_or("default"),
+        service.metadata.name.as_deref().unwrap_or_default()
+    )
+}
+
+#[derive(Default)]
+struct ServiceStore {
+    active: HashMap<String, Service>,
+    pending: Option<HashMap<String, Service>>,
+}
+
+impl ServiceStore {
+    fn apply(&mut self, event: watcher::Event<Service>) -> Option<Vec<Service>> {
+        match event {
+            watcher::Event::Init => {
+                self.pending = Some(HashMap::new());
+                None
+            }
+            watcher::Event::InitApply(service) => {
+                self.pending
+                    .get_or_insert_with(HashMap::new)
+                    .insert(service_key(&service), service);
+                None
+            }
+            watcher::Event::InitDone => {
+                self.active = self.pending.take().unwrap_or_default();
+                Some(self.snapshot())
+            }
+            watcher::Event::Apply(service) => {
+                self.active.insert(service_key(&service), service);
+                Some(self.snapshot())
+            }
+            watcher::Event::Delete(service) => {
+                self.active.remove(&service_key(&service));
+                Some(self.snapshot())
+            }
+        }
+    }
+
+    fn snapshot(&self) -> Vec<Service> {
+        self.active.values().cloned().collect()
     }
 }
 
@@ -218,6 +266,7 @@ fn parse_annotation<T: FromStr + Copy>(
 mod tests {
     use super::*;
     use k8s_openapi::api::core::v1::Service;
+    use kube::runtime::watcher;
     use serde_json::json;
 
     fn service(annotations: serde_json::Value, ports: serde_json::Value) -> Service {
@@ -239,6 +288,83 @@ mod tests {
             {"name": "http", "port": 8080},
             {"name": "https", "port": 8443}
         ])
+    }
+
+    #[test]
+    fn service_store_buffers_initial_snapshot_until_init_done() {
+        let mut store = ServiceStore::default();
+        let service = service(json!({WEBFINGER_KEY: "true"}), ports());
+
+        assert!(store.apply(watcher::Event::Init).is_none());
+        assert!(store.apply(watcher::Event::InitApply(service)).is_none());
+
+        let snapshot = store
+            .apply(watcher::Event::InitDone)
+            .expect("complete initialization should publish");
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(snapshot[0].metadata.name.as_deref(), Some("test-service"));
+    }
+
+    #[test]
+    fn service_store_applies_and_deletes_live_events() {
+        let mut store = ServiceStore::default();
+        let initial = service(json!({WEBFINGER_KEY: "true"}), ports());
+        store.apply(watcher::Event::Init);
+        store.apply(watcher::Event::InitApply(initial));
+        store.apply(watcher::Event::InitDone);
+
+        let updated = service(
+            json!({WEBFINGER_KEY: "true"}),
+            json!([{ "name": "http", "port": 9090 }]),
+        );
+        let snapshot = store
+            .apply(watcher::Event::Apply(updated))
+            .expect("applied events should publish");
+        assert_eq!(snapshot.len(), 1);
+        assert_eq!(
+            snapshot[0].spec.as_ref().unwrap().ports.as_ref().unwrap()[0].port,
+            9090
+        );
+
+        let deleted = service(json!({WEBFINGER_KEY: "true"}), ports());
+        let snapshot = store
+            .apply(watcher::Event::Delete(deleted))
+            .expect("deleted events should publish");
+        assert!(snapshot.is_empty());
+    }
+
+    #[test]
+    fn service_store_relist_replaces_stale_services_atomically() {
+        let mut store = ServiceStore::default();
+        let retained = service(json!({WEBFINGER_KEY: "true"}), ports());
+        let stale = serde_json::from_value(json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {
+                "name": "stale-service",
+                "namespace": "apps",
+                "annotations": {WEBFINGER_KEY: "true"}
+            },
+            "spec": {"ports": [{"name": "http", "port": 8081}]}
+        }))
+        .expect("test service should deserialize");
+
+        store.apply(watcher::Event::Init);
+        store.apply(watcher::Event::InitApply(retained.clone()));
+        store.apply(watcher::Event::InitApply(stale));
+        store.apply(watcher::Event::InitDone);
+
+        store.apply(watcher::Event::Init);
+        store.apply(watcher::Event::InitApply(retained));
+        let snapshot = store
+            .apply(watcher::Event::InitDone)
+            .expect("relist completion should publish");
+        assert_eq!(snapshot.len(), 1);
+        assert!(
+            snapshot
+                .iter()
+                .all(|s| s.metadata.name.as_deref() != Some("stale-service"))
+        );
     }
 
     #[test]
