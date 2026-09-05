@@ -8,7 +8,7 @@ controllers:
         enabled: true
         image:
           repository: ghcr.io/m00nwtchr/fingerjoin
-          tag: 0.4.1
+          tag: 0.4.2
           digest: ""
           pullPolicy: IfNotPresent
 
