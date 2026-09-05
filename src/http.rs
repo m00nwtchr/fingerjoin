@@ -3,17 +3,17 @@ use crate::error::Error;
 use crate::k8s::BackendState;
 use crate::webfinger::{filter_rels, merge_jrd, to_json_bytes};
 use axum::{
+    Json, Router,
     body::Body,
     extract::{Query, State},
     http::{Method, StatusCode},
     response::{IntoResponse, Response},
     routing::get,
-    Json, Router,
 };
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::{DefaultMakeSpan, DefaultOnResponse, TraceLayer};
-use tracing::{debug, info, warn, Level};
+use tracing::{Level, debug, info, warn};
 
 /// Cap on concurrent backend requests per incoming query.
 const MAX_IN_FLIGHT: usize = 10;
@@ -219,7 +219,12 @@ mod tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
-        assert!(resp.headers().contains_key("retry-after"));
+        assert_eq!(
+            resp.headers()
+                .get("retry-after")
+                .and_then(|value| value.to_str().ok()),
+            Some("10")
+        );
     }
 
     #[tokio::test]
@@ -262,10 +267,12 @@ mod tests {
         // Higher priority backend wins the contested property.
         assert_eq!(body["properties"]["http://example.com/ns/variant"], "b");
         // Nonstandard `template` member passes through.
-        assert!(links
-            .iter()
-            .any(|l| l["rel"] == "http://ostatus.org/schema/1.0/subscribe"
-                && l["template"].is_string()));
+        assert!(
+            links
+                .iter()
+                .any(|l| l["rel"] == "http://ostatus.org/schema/1.0/subscribe"
+                    && l["template"].is_string())
+        );
     }
 
     #[tokio::test]

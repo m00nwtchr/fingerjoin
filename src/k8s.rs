@@ -1,14 +1,14 @@
 use crate::backend::Backend;
+use futures::StreamExt;
 use k8s_openapi::api::core::v1::Service;
 use kube::{
     Client,
-    api::{Api, ListParams},
-    runtime::watcher,
+    api::Api,
+    runtime::{WatchStreamExt, watcher},
 };
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, str::FromStr, sync::Arc};
 use tokio::sync::RwLock;
-use tokio::time::{Instant as TokioInstant, MissedTickBehavior, interval_at};
 use tracing::{debug, error, info, warn};
 
 const WEBFINGER_KEY: &str = "fingerjoin.naktis.eu/webfinger";
@@ -16,7 +16,7 @@ const PRIORITY_KEY: &str = "fingerjoin.naktis.eu/priority";
 const HTTPS_KEY: &str = "fingerjoin.naktis.eu/https";
 const PORT_KEY: &str = "fingerjoin.naktis.eu/port";
 
-pub const SYNC_INTERVAL: Duration = Duration::from_secs(30);
+pub const RETRY_AFTER: Duration = Duration::from_secs(10);
 
 pub struct BackendState {
     backends: RwLock<Vec<Backend>>,
@@ -116,22 +116,20 @@ impl ServiceStore {
 
 pub async fn start_reconciler(client: Client, state: Arc<BackendState>, cluster_domain: String) {
     let api: Api<Service> = Api::all(client);
+    let stream = watcher(api, watcher::Config::default()).default_backoff();
+    futures::pin_mut!(stream);
+    let mut store = ServiceStore::default();
 
-    let mut ticker = interval_at(TokioInstant::now() + SYNC_INTERVAL, SYNC_INTERVAL);
-    ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
-
-    loop {
-        ticker.tick().await;
-
-        match api.list(&ListParams::default()).await {
-            Ok(services) => {
-                let backends = backends_from_services(services, &cluster_domain);
-                state.update(backends).await;
+    while let Some(event) = stream.next().await {
+        match event {
+            Ok(event) => {
+                if let Some(services) = store.apply(event) {
+                    let backends = backends_from_services(services, &cluster_domain);
+                    state.update(backends).await;
+                }
             }
-            Err(e) => {
-                // Keep serving the previous backend set; readiness stays
-                // green because a stale list beats no service at all.
-                error!(error = %e, "failed to list Services, keeping previous backends");
+            Err(error) => {
+                error!(error = %error, "Service watcher failed, retaining previous backends");
             }
         }
     }

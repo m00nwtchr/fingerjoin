@@ -50,12 +50,9 @@ impl axum::response::IntoResponse for Error {
             .status(status)
             .header("Content-Type", "application/json");
 
-        // 503s are transient: the backend set refreshes on the next sync.
+        // 503s are transient while the watcher recovers.
         if matches!(self, Error::NoBackends) {
-            builder = builder.header(
-                "Retry-After",
-                crate::k8s::SYNC_INTERVAL.as_secs().to_string(),
-            );
+            builder = builder.header("Retry-After", crate::k8s::RETRY_AFTER.as_secs().to_string());
         }
 
         builder
